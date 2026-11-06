@@ -1,0 +1,106 @@
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:?PG_PASS required}
+      POSTGRES_USER: ${PG_USER:-nextcloud}
+      POSTGRES_DB: ${PG_DB:-nextcloud}
+    networks:
+      - internal
+
+  redis:
+    image: docker.io/library/redis:alpine
+    command: --save 60 1 --loglevel warning
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 3s
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - internal
+
+  app:
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud}:${NEXTCLOUD_TAG:?NEXTCLOUD_TAG required}
+    restart: unless-stopped
+    environment:
+      # ── DB ──
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${PG_DB:-nextcloud}
+      POSTGRES_USER: ${PG_USER:-nextcloud}
+      POSTGRES_PASSWORD: ${PG_PASS:?PG_PASS required}
+      # ── Cache / locking ──
+      REDIS_HOST: redis
+      # ── First-boot auto-install ──
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:?NEXTCLOUD_ADMIN_USER required}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?NEXTCLOUD_ADMIN_PASSWORD required}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_DOMAIN:?NEXTCLOUD_DOMAIN required}
+      # ── Reverse-proxy hygiene (Caddy on localhost) ──
+      TRUSTED_PROXIES: 127.0.0.1
+      OVERWRITEHOST: ${NEXTCLOUD_DOMAIN:?NEXTCLOUD_DOMAIN required}
+      OVERWRITEPROTOCOL: https
+      OVERWRITECLIURL: https://${NEXTCLOUD_DOMAIN}
+      # ── PHP tuning ──
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-512M}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:-2G}
+    volumes:
+      # App install: apps, config, themes. Stays small (few hundred MB).
+      - ./html:/var/www/html
+      # User data: the bulk. Split out so it can be relocated to a
+      # dedicated drive later without touching the install.
+      - ./userdata:/var/www/html/data
+    ports:
+      - "127.0.0.1:${NEXTCLOUD_PORT:?NEXTCLOUD_PORT required}:80"
+    # Allows Nextcloud to reach Authentik by hostname (hairpin fix —
+    # Docker's internal DNS won't resolve an external domain back to localhost).
+    extra_hosts:
+      - "${AUTH_DOMAIN:?AUTH_DOMAIN required}:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+
+  cron:
+    image: ${NEXTCLOUD_IMAGE:-docker.io/library/nextcloud}:${NEXTCLOUD_TAG:?NEXTCLOUD_TAG required}
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    volumes:
+      - ./html:/var/www/html
+      - ./userdata:/var/www/html/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+
+  whiteboard:
+    image: ${WHITEBOARD_IMAGE:-ghcr.io/nextcloud-releases/whiteboard}:${WHITEBOARD_TAG:?WHITEBOARD_TAG required}
+    restart: unless-stopped
+    environment:
+      NEXTCLOUD_URL: https://${NEXTCLOUD_DOMAIN:?NEXTCLOUD_DOMAIN required}
+      JWT_SECRET_KEY: ${WHITEBOARD_SECRET:?WHITEBOARD_SECRET required}
+      MAX_UPLOAD_FILE_SIZE: 50
+    ports:
+      - "127.0.0.1:${WHITEBOARD_PORT:?WHITEBOARD_PORT required}:3002"
+    extra_hosts:
+      - "${NEXTCLOUD_DOMAIN}:host-gateway"
+
+networks:
+  internal:
